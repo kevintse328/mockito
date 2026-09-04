@@ -1,0 +1,132 @@
+version: 2.1
+
+# TODO: import the orb that provides the `with_tool_cache` step and the
+# `cache` subcommand it wraps. It isn't a public orb — pull in whichever
+# internal orb your org publishes it from, e.g.:
+# orbs:
+#   internal-cache: circleci/internal-tool-cache@x.y.z
+
+executors:
+  gradle-machine:
+    machine:
+      image: ubuntu-2604:current
+    # This is the resource class the tool-cache feature is validated
+    # against — swap it if your org runs the feature on a different class.
+    resource_class: large.gen3
+    environment:
+      GRADLE_OPTS: -Dorg.gradle.welcome=never
+
+commands:
+  # Mockito's own CI builds with JDK 17 (they use the Zulu distribution
+  # via actions/setup-java) — matching that avoids any surprises from a
+  # JDK the project itself doesn't build/test against.
+  install-jdk-17:
+    steps:
+      - run:
+          name: Install Temurin JDK 17
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y wget gnupg ca-certificates lsb-release
+            wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
+              | sudo gpg --dearmor -o /usr/share/keyrings/adoptium.gpg
+            echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(lsb_release -cs) main" \
+              | sudo tee /etc/apt/sources.list.d/adoptium.list
+            sudo apt-get update
+            sudo apt-get install -y temurin-17-jdk
+            sudo update-alternatives --set java "$(update-alternatives --list java | grep 'temurin-17')"
+            echo "export JAVA_HOME=/usr/lib/jvm/temurin-17-jdk-amd64" >> "$BASH_ENV"
+            java -version
+
+  timed_build:
+    parameters:
+      step_name:
+        type: string
+      command:
+        type: string
+    steps:
+      - run:
+          name: << parameters.step_name >>
+          command: |
+            start=$(date +%s%N)
+            << parameters.command >>
+            end=$(date +%s%N)
+            echo "export BUILD_NS=$((end - start))" >> "$BASH_ENV"
+
+jobs:
+  # First-ever build against this cache key: nothing to reuse yet, so
+  # every task actually executes. This *is* the cold measurement.
+  cold-build:
+    executor: gradle-machine
+    steps:
+      - checkout
+      - install-jdk-17
+      - with_tool_cache:
+          tool: gradle
+          steps:
+            - timed_build:
+                step_name: "Cold build (populates the cache)"
+                command: ./gradlew --no-daemon --build-cache clean build
+      - run:
+          name: Record cold build time
+          command: |
+            mkdir -p /tmp/bench-results
+            echo $((BUILD_NS / 1000000)) > /tmp/bench-results/cold-ms
+            echo "Cold build: $(cat /tmp/bench-results/cold-ms) ms"
+      - persist_to_workspace:
+          root: /tmp
+          paths:
+            - bench-results
+
+  # Runs after cold-build. Same clean + build, but every task's inputs
+  # are already in the cache from the cold run, so tasks should come
+  # back FROM-CACHE instead of re-executing.
+  warm-build:
+    executor: gradle-machine
+    steps:
+      - checkout
+      - install-jdk-17
+      - with_tool_cache:
+          tool: gradle
+          steps:
+            - timed_build:
+                step_name: "Warm build (reuses the cache)"
+                command: ./gradlew --no-daemon --build-cache clean build
+      - attach_workspace:
+          at: /tmp
+      - run:
+          name: Record warm build time
+          command: |
+            echo $((BUILD_NS / 1000000)) > /tmp/bench-results/warm-ms
+            echo "Warm build: $(cat /tmp/bench-results/warm-ms) ms"
+      - persist_to_workspace:
+          root: /tmp
+          paths:
+            - bench-results
+
+  compare-report:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - attach_workspace:
+          at: /tmp
+      - run:
+          name: Cold vs. warm delta
+          command: |
+            cold=$(cat /tmp/bench-results/cold-ms)
+            warm=$(cat /tmp/bench-results/warm-ms)
+            delta=$((cold - warm))
+            pct=$(awk -v c="$cold" -v w="$warm" 'BEGIN { printf "%.1f", (1 - w/c) * 100 }')
+            echo "Cold:  ${cold} ms"
+            echo "Warm:  ${warm} ms"
+            echo "Delta: ${delta} ms (${pct}% faster warm)"
+
+workflows:
+  cache-comparison:
+    jobs:
+      - cold-build
+      - warm-build:
+          requires:
+            - cold-build
+      - compare-report:
+          requires:
+            - warm-build
