@@ -101,7 +101,7 @@ jobs:
             - run:
                 name: Seed build
                 command: |
-                  ./gradlew --no-daemon --build-cache --info clean build \
+                  ./gradlew --no-daemon --build-cache --console=plain --info clean build \
                     2>&1 | tee /tmp/gradle-build-seed.log
       - save_cache:
           # Same CIRCLE_WORKFLOW_ID across every job in this workflow run,
@@ -179,7 +179,7 @@ jobs:
                   - timed_build:
                       step_name: "clean build (cache-server)"
                       command: |
-                        ./gradlew --no-daemon --build-cache --info clean build \
+                        ./gradlew --no-daemon --build-cache --console=plain --info clean build \
                           2>&1 | tee /tmp/gradle-build-cache-server.log
       - unless:
           condition: << parameters.use_cache_subcommand >>
@@ -187,10 +187,16 @@ jobs:
             - timed_build:
                 step_name: "clean build"
                 command: |
-                  ./gradlew --no-daemon --build-cache --info clean build \
+                  ./gradlew --no-daemon --build-cache --console=plain --info clean build \
                     2>&1 | tee "/tmp/gradle-build-${BENCH_VARIANT}.log"
       - gradle_build_with_cache_summary:
-          variant: "${BENCH_VARIANT}"
+          # Must be the same static Mustache expression used for
+          # $BENCH_VARIANT above, not the runtime bash variable itself:
+          # command parameters resolve at config-compile time, before any
+          # shell runs, so store_artifacts (a static field, not a bash
+          # context) would otherwise get the literal string
+          # "${BENCH_VARIANT}" instead of the real variant name.
+          variant: "<<# parameters.use_cache_subcommand >>cache-server<</ parameters.use_cache_subcommand >><<^ parameters.use_cache_subcommand >><<# parameters.use_circleci_cache >>circleci-cache<</ parameters.use_circleci_cache >><<^ parameters.use_circleci_cache >>no-cache<</ parameters.use_circleci_cache >><</ parameters.use_cache_subcommand >>"
       - run:
           name: Record result
           when: always
