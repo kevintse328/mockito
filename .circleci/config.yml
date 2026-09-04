@@ -74,21 +74,50 @@ commands:
 
             # Real task-status lines look like "> Task :module:task FROM-CACHE"
             # (Gradle renders this prefix even under --console=plain when a
-            # pty is attached, e.g. on the machine executor). Anchoring on a
-            # bare ":module:task" instead — as an earlier version of this
-            # script did — also matches lines like
-            # ":mockito-core:clean (Thread[...]) started.", which explains
-            # why totals looked plausible while every status count was zero.
-            from_cache=$(grep -cE '^> Task :\S+[[:space:]]+FROM-CACHE[[:space:]]*$' "$clean_log" || true)
-            up_to_date=$(grep -cE '^> Task :\S+[[:space:]]+UP-TO-DATE[[:space:]]*$' "$clean_log" || true)
-            no_source=$(grep -cE '^> Task :\S+[[:space:]]+NO-SOURCE[[:space:]]*$' "$clean_log" || true)
-            skipped=$(grep -cE '^> Task :\S+[[:space:]]+SKIPPED[[:space:]]*$' "$clean_log" || true)
-            total_tasks=$(grep -cE '^> Task :\S+' "$clean_log" || true)
-
+            # pty is attached, e.g. on the machine executor).
+            #
+            # Each task actually produces up to TWO lines: a bare
+            # "> Task :path" announcement when it starts, then a second
+            # "> Task :path FROM-CACHE"/"UP-TO-DATE"/etc. line once its
+            # outcome is known — tasks that just execute normally only ever
+            # get the first, bare line. Counting lines directly therefore
+            # double-counts every cache/skip/no-source outcome (one line
+            # for the start, one for the result). Instead, build a map of
+            # task path -> last status seen; since the bare line always
+            # comes first and any real outcome line comes after, the last
+            # value per path is the correct final status.
             echo "--- Sample of raw task-status lines (first 15) ---"
             grep -E '^> Task :\S+' "$clean_log" | head -15
             echo "----------------------------------------------------"
-            executed=$((total_tasks - from_cache - up_to_date - no_source - skipped))
+
+            # Avoiding a heredoc/here-string here on purpose: CircleCI's
+            # config preprocessor treats two consecutive angle brackets as
+            # the start of a parameter tag, which is exactly what bit us
+            # earlier when a plain bash heredoc triggered an unclosed-tag
+            # error. Using set -- sidesteps the whole issue.
+            set -- $(awk '
+              /^> Task :/ {
+                line = $0
+                sub(/^> Task /, "", line)
+                split(line, parts, " ")
+                path = parts[1]
+                status = (length(parts) >= 2) ? parts[2] : "EXECUTED"
+                status_by_path[path] = status
+              }
+              END {
+                for (p in status_by_path) {
+                  s = status_by_path[p]
+                  total++
+                  if (s == "FROM-CACHE") from_cache++
+                  else if (s == "UP-TO-DATE") up_to_date++
+                  else if (s == "NO-SOURCE") no_source++
+                  else if (s == "SKIPPED") skipped++
+                  else executed++
+                }
+                printf "%d %d %d %d %d %d\n", from_cache+0, up_to_date+0, no_source+0, skipped+0, executed+0, total+0
+              }
+            ' "$clean_log")
+            from_cache=$1; up_to_date=$2; no_source=$3; skipped=$4; executed=$5; total_tasks=$6
             echo "Variant:      << parameters.variant >>"
             echo "Total tasks:  ${total_tasks}"
             echo "FROM-CACHE:   ${from_cache}"
@@ -104,10 +133,19 @@ commands:
           destination: gradle-logs/<< parameters.variant >>.log
 
 jobs:
-  # Populates BOTH cache backends in one pass: the tool-cache/cache-server
-  # (via with_tool_cache) and CircleCI's native workspace cache (via
-  # save_cache of ~/.gradle/caches) — so the two warm variants below are
-  # racing against caches seeded from the same build.
+  # Populates BOTH cache backends, via two separate builds:
+  #
+  # 1. with_tool_cache seeds whatever backing store the cache-server
+  #    mechanism uses (confirmed from an earlier run's log to be a local
+  #    HTTP proxy, not the on-disk ~/.gradle/caches/build-cache-1 dir).
+  # 2. A second, plain build with Gradle's *local* disk cache explicitly
+  #    enabled populates build-cache-1 for real, so that save_cache below
+  #    is actually snapshotting real task-output cache entries — not just
+  #    the downloaded-dependency cache under modules-2. Without this
+  #    second pass, the circleci-cache variant's restore_cache pulls a
+  #    ~/.gradle/caches that never had build-cache-1 entries in it, so it
+  #    can only ever save dependency-download time, not task-execution
+  #    time — a different (and smaller) effect than cache-server measures.
   seed-gradle:
     executor: gradle-machine
     steps:
@@ -117,10 +155,24 @@ jobs:
           tool: gradle
           steps:
             - run:
-                name: Seed build
+                name: Seed build (cache-server backing store)
                 command: |
                   ./gradlew --no-daemon --build-cache --console=plain --info clean build \
                     2>&1 | tee /tmp/gradle-build-seed.log
+      - run:
+          name: Seed build (local disk build cache, for circleci-cache)
+          command: |
+            mkdir -p ~/.gradle/init.d
+            cat > ~/.gradle/init.d/circleci.gradle.kts \<<'INNEREOF'
+            settingsEvaluated {
+              buildCache {
+                local { isEnabled = true }
+              }
+            }
+            INNEREOF
+            ./gradlew --no-daemon --build-cache --console=plain --info clean build \
+              2>&1 | tee /tmp/gradle-build-seed-local.log
+            rm -f ~/.gradle/init.d/circleci.gradle.kts
       - save_cache:
           # Same CIRCLE_WORKFLOW_ID across every job in this workflow run,
           # so this is an exact key, not a prefix fallback — no ambiguity
