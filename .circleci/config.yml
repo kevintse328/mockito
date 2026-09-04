@@ -147,7 +147,7 @@ jobs:
                       name: Write Gradle init script (local build cache from restored dir)
                       command: |
                         mkdir -p ~/.gradle/init.d
-                        cat > ~/.gradle/init.d/circleci.gradle.kts << 'INNEREOF'
+                        cat > ~/.gradle/init.d/circleci.gradle.kts \<<'INNEREOF'
                         settingsEvaluated {
                           buildCache {
                             local { isEnabled = true }
@@ -162,7 +162,7 @@ jobs:
                       name: Write Gradle init script (caches disabled — true baseline)
                       command: |
                         mkdir -p ~/.gradle/init.d
-                        cat > ~/.gradle/init.d/circleci.gradle.kts << 'INNEREOF'
+                        cat > ~/.gradle/init.d/circleci.gradle.kts \<<'INNEREOF'
                         settingsEvaluated {
                           buildCache {
                             local { isEnabled = false }
