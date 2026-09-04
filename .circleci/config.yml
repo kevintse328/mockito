@@ -67,10 +67,22 @@ commands:
               echo "No log found at $log — build likely failed before logging started."
               exit 0
             fi
-            from_cache=$(grep -cE '^:\S+ FROM-CACHE$' "$log" || true)
-            up_to_date=$(grep -cE '^:\S+ UP-TO-DATE$' "$log" || true)
-            no_source=$(grep -cE '^:\S+ NO-SOURCE$' "$log" || true)
-            total_tasks=$(grep -cE '^:\S+' "$log" || true)
+            # Strip any trailing \r first (a pty on the machine executor can
+            # inject these even under --console=plain), so anchored matches
+            # below aren't silently defeated by an invisible character.
+            clean_log="/tmp/gradle-build-<< parameters.variant >>.clean.log"
+            tr -d '\r' < "$log" > "$clean_log"
+
+            from_cache=$(grep -cE '^:\S+[[:space:]]+FROM-CACHE[[:space:]]*$' "$clean_log" || true)
+            up_to_date=$(grep -cE '^:\S+[[:space:]]+UP-TO-DATE[[:space:]]*$' "$clean_log" || true)
+            no_source=$(grep -cE '^:\S+[[:space:]]+NO-SOURCE[[:space:]]*$' "$clean_log" || true)
+            total_tasks=$(grep -cE '^:\S+' "$clean_log" || true)
+
+            echo "--- Sample of raw task-status lines (first 15) ---"
+            grep -E '^:\S+' "$clean_log" | head -15
+            echo "--- Any line mentioning cache at all, case-insensitive (first 15) ---"
+            grep -iE 'cache' "$clean_log" | head -15
+            echo "----------------------------------------------------"
             executed=$((total_tasks - from_cache - up_to_date - no_source))
             echo "Variant:      << parameters.variant >>"
             echo "Total tasks:  ${total_tasks}"
