@@ -243,6 +243,28 @@ jobs:
       - when:
           condition: << parameters.use_cache_subcommand >>
           steps:
+            - restore_cache:
+                # Same exact-match key as circleci-cache above. This gives
+                # cache-server a warm ~/.gradle/caches/modules-2 too — the
+                # dependency-download cache used to resolve buildSrc's
+                # plugin classpath (Kotlin, Android tooling, etc.), which
+                # is a *different* cache from the build-cache-1 task-output
+                # cache and has nothing to do with with_tool_cache. Without
+                # this, cache-server was paying for ~200+ real network
+                # round-trips per run that circleci-cache got for free via
+                # its own restore_cache — inflating the gap between them
+                # with an effect neither variant's mechanism was supposed
+                # to be measured on.
+                keys:
+                  - mockito-gradle-bench-{{ .Environment.CIRCLE_WORKFLOW_ID }}
+            - run:
+                # Strip out any local disk build-cache entries the restore
+                # just brought in, so every FROM-CACHE/UP-TO-DATE hit this
+                # variant gets is forced through the remote tool-cache
+                # proxy being tested — not an incidental local-disk hit
+                # riding along on the same restored directory.
+                name: Clear local build-cache-1 (keep modules-2 warm)
+                command: rm -rf ~/.gradle/caches/build-cache-1
             - with_tool_cache:
                 tool: gradle
                 steps:
