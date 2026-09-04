@@ -87,7 +87,7 @@ commands:
             # comes first and any real outcome line comes after, the last
             # value per path is the correct final status.
             echo "--- Sample of raw task-status lines (first 15) ---"
-            grep -E '^> Task :\S+' "$clean_log" | head -15
+            grep -m 15 -E '^> Task :\S+' "$clean_log"
             echo "----------------------------------------------------"
 
             # Avoiding a heredoc/here-string here on purpose: CircleCI's
