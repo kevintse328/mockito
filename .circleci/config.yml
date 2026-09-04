@@ -16,23 +16,22 @@ executors:
       GRADLE_OPTS: -Dorg.gradle.welcome=never
 
 commands:
-  # Mockito's own CI builds with JDK 17 (Zulu, via actions/setup-java) —
-  # matching that avoids surprises from a JDK the project doesn't build against.
+  # Mockito's own CI builds with JDK 17 (Zulu, via actions/setup-java) — any
+  # conformant OpenJDK 17 build works, since the JDK vendor isn't part of
+  # what we're benchmarking. Using Ubuntu's own openjdk-17-jdk package
+  # instead of Eclipse Temurin: Adoptium's own download servers have been
+  # observed throttling to ~100-200 kB/s for the ~167 MB JDK download (a
+  # known pain point under CI-scale traffic), while archive.ubuntu.com is
+  # fast and already the trusted source for everything else in this image.
   install-jdk-17:
     steps:
       - run:
-          name: Install Temurin JDK 17
+          name: Install OpenJDK 17
           command: |
             sudo apt-get update
-            sudo apt-get install -y wget gnupg ca-certificates lsb-release
-            wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
-              | sudo gpg --dearmor -o /usr/share/keyrings/adoptium.gpg
-            echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(lsb_release -cs) main" \
-              | sudo tee /etc/apt/sources.list.d/adoptium.list
-            sudo apt-get update
-            sudo apt-get install -y temurin-17-jdk
-            sudo update-alternatives --set java "$(update-alternatives --list java | grep 'temurin-17')"
-            echo "export JAVA_HOME=/usr/lib/jvm/temurin-17-jdk-amd64" >> "$BASH_ENV"
+            sudo apt-get install -y openjdk-17-jdk
+            sudo update-alternatives --set java "$(update-alternatives --list java | grep 'java-17')"
+            echo "export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$BASH_ENV"
             java -version
 
   timed_build:
