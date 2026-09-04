@@ -1,8 +1,7 @@
 version: 2.1
 
 # TODO: import the orb that provides the `with_tool_cache` step and the
-# `cache` subcommand it wraps. It isn't a public orb — pull in whichever
-# internal orb your org publishes it from, e.g.:
+# `cache` subcommand it wraps — see the cache-server variant below.
 # orbs:
 #   internal-cache: circleci/internal-tool-cache@x.y.z
 
@@ -10,16 +9,15 @@ executors:
   gradle-machine:
     machine:
       image: ubuntu-2604:current
-    # This is the resource class the tool-cache feature is validated
-    # against — swap it if your org runs the feature on a different class.
+    # The resource class the tool-cache feature is validated against —
+    # swap it if your org runs the feature on a different class.
     resource_class: large.gen3
     environment:
       GRADLE_OPTS: -Dorg.gradle.welcome=never
 
 commands:
-  # Mockito's own CI builds with JDK 17 (they use the Zulu distribution
-  # via actions/setup-java) — matching that avoids any surprises from a
-  # JDK the project itself doesn't build/test against.
+  # Mockito's own CI builds with JDK 17 (Zulu, via actions/setup-java) —
+  # matching that avoids surprises from a JDK the project doesn't build against.
   install-jdk-17:
     steps:
       - run:
@@ -52,10 +50,47 @@ commands:
             end=$(date +%s%N)
             echo "export BUILD_NS=$((end - start))" >> "$BASH_ENV"
 
+  # Runs the build with --info, tees the full log to disk, then counts
+  # how many tasks came back FROM-CACHE vs. UP-TO-DATE vs. actually executed.
+  # This is the "what did it actually pull" visibility, independent of timing.
+  gradle_build_with_cache_summary:
+    parameters:
+      variant:
+        type: string
+    steps:
+      - run:
+          name: "Task outcome summary (<< parameters.variant >>)"
+          when: always
+          command: |
+            log="/tmp/gradle-build-<< parameters.variant >>.log"
+            if [ ! -f "$log" ]; then
+              echo "No log found at $log — build likely failed before logging started."
+              exit 0
+            fi
+            from_cache=$(grep -cE '^:\S+ FROM-CACHE$' "$log" || true)
+            up_to_date=$(grep -cE '^:\S+ UP-TO-DATE$' "$log" || true)
+            no_source=$(grep -cE '^:\S+ NO-SOURCE$' "$log" || true)
+            total_tasks=$(grep -cE '^:\S+' "$log" || true)
+            executed=$((total_tasks - from_cache - up_to_date - no_source))
+            echo "Variant:      << parameters.variant >>"
+            echo "Total tasks:  ${total_tasks}"
+            echo "FROM-CACHE:   ${from_cache}"
+            echo "UP-TO-DATE:   ${up_to_date}"
+            echo "NO-SOURCE:    ${no_source}"
+            echo "Executed:     ${executed}"
+            mkdir -p /tmp/bench-results/gradle-cache-summary
+            echo "${from_cache},${up_to_date},${no_source},${executed},${total_tasks}" \
+              > "/tmp/bench-results/gradle-cache-summary/<< parameters.variant >>"
+      - store_artifacts:
+          path: /tmp/gradle-build-<< parameters.variant >>.log
+          destination: gradle-logs/<< parameters.variant >>.log
+
 jobs:
-  # First-ever build against this cache key: nothing to reuse yet, so
-  # every task actually executes. This *is* the cold measurement.
-  cold-build:
+  # Populates BOTH cache backends in one pass: the tool-cache/cache-server
+  # (via with_tool_cache) and CircleCI's native workspace cache (via
+  # save_cache of ~/.gradle/caches) — so the two warm variants below are
+  # racing against caches seeded from the same build.
+  seed-gradle:
     executor: gradle-machine
     steps:
       - checkout
@@ -63,70 +98,171 @@ jobs:
       - with_tool_cache:
           tool: gradle
           steps:
-            - timed_build:
-                step_name: "Cold build (populates the cache)"
-                command: ./gradlew --no-daemon --build-cache clean build
-      - run:
-          name: Record cold build time
-          command: |
-            mkdir -p /tmp/bench-results
-            echo $((BUILD_NS / 1000000)) > /tmp/bench-results/cold-ms
-            echo "Cold build: $(cat /tmp/bench-results/cold-ms) ms"
-      - persist_to_workspace:
-          root: /tmp
+            - run:
+                name: Seed build
+                command: |
+                  ./gradlew --no-daemon --build-cache --info clean build \
+                    2>&1 | tee /tmp/gradle-build-seed.log
+      - save_cache:
+          # Same CIRCLE_WORKFLOW_ID across every job in this workflow run,
+          # so this is an exact key, not a prefix fallback — no ambiguity
+          # about "most recent," and no risk of a concurrent run's cache
+          # winning the slot.
+          key: mockito-gradle-bench-{{ .Environment.CIRCLE_WORKFLOW_ID }}
           paths:
-            - bench-results
+            - ~/.gradle/caches
+            - ~/.gradle/wrapper
 
-  # Runs after cold-build. Same clean + build, but every task's inputs
-  # are already in the cache from the cold run, so tasks should come
-  # back FROM-CACHE instead of re-executing.
-  warm-build:
+  benchmark-gradle:
     executor: gradle-machine
+    parameters:
+      use_cache_subcommand:
+        type: boolean
+      use_circleci_cache:
+        type: boolean
+        default: false
     steps:
       - checkout
       - install-jdk-17
-      - with_tool_cache:
-          tool: gradle
+      - run:
+          name: Record variant name
+          command: |
+            variant="<<# parameters.use_cache_subcommand >>cache-server<</ parameters.use_cache_subcommand >><<^ parameters.use_cache_subcommand >><<# parameters.use_circleci_cache >>circleci-cache<</ parameters.use_circleci_cache >><<^ parameters.use_circleci_cache >>no-cache<</ parameters.use_circleci_cache >><</ parameters.use_cache_subcommand >>"
+            echo "export BENCH_VARIANT=$variant" >> "$BASH_ENV"
+      - unless:
+          condition: << parameters.use_cache_subcommand >>
+          steps:
+            - when:
+                condition: << parameters.use_circleci_cache >>
+                steps:
+                  - run:
+                      name: Start cache restore + build timer
+                      command: echo "export TIMER_START_NS=$(date +%s%N)" >> "$BASH_ENV"
+                  - restore_cache:
+                      keys:
+                        # Exact match against this workflow run's own seed —
+                        # see the note on save_cache above.
+                        - mockito-gradle-bench-{{ .Environment.CIRCLE_WORKFLOW_ID }}
+                  - run:
+                      name: Write Gradle init script (local build cache from restored dir)
+                      command: |
+                        mkdir -p ~/.gradle/init.d
+                        cat > ~/.gradle/init.d/circleci.gradle.kts << 'INNEREOF'
+                        settingsEvaluated {
+                          buildCache {
+                            local { isEnabled = true }
+                          }
+                        }
+                        INNEREOF
+                        cat ~/.gradle/init.d/circleci.gradle.kts
+            - unless:
+                condition: << parameters.use_circleci_cache >>
+                steps:
+                  - run:
+                      name: Write Gradle init script (caches disabled — true baseline)
+                      command: |
+                        mkdir -p ~/.gradle/init.d
+                        cat > ~/.gradle/init.d/circleci.gradle.kts << 'INNEREOF'
+                        settingsEvaluated {
+                          buildCache {
+                            local { isEnabled = false }
+                          }
+                        }
+                        INNEREOF
+                        cat ~/.gradle/init.d/circleci.gradle.kts
+      - when:
+          condition: << parameters.use_cache_subcommand >>
+          steps:
+            - with_tool_cache:
+                tool: gradle
+                steps:
+                  - timed_build:
+                      step_name: "clean build (cache-server)"
+                      command: |
+                        ./gradlew --no-daemon --build-cache --info clean build \
+                          2>&1 | tee /tmp/gradle-build-cache-server.log
+      - unless:
+          condition: << parameters.use_cache_subcommand >>
           steps:
             - timed_build:
-                step_name: "Warm build (reuses the cache)"
-                command: ./gradlew --no-daemon --build-cache clean build
-      - attach_workspace:
-          at: /tmp
+                step_name: "clean build"
+                command: |
+                  ./gradlew --no-daemon --build-cache --info clean build \
+                    2>&1 | tee "/tmp/gradle-build-${BENCH_VARIANT}.log"
+      - gradle_build_with_cache_summary:
+          variant: "${BENCH_VARIANT}"
       - run:
-          name: Record warm build time
+          name: Record result
+          when: always
           command: |
-            echo $((BUILD_NS / 1000000)) > /tmp/bench-results/warm-ms
-            echo "Warm build: $(cat /tmp/bench-results/warm-ms) ms"
+            mkdir -p /tmp/bench-results/gradle
+            if [ -n "${BUILD_NS:-}" ]; then
+              echo $((BUILD_NS / 1000000)) > /tmp/bench-results/gradle/$BENCH_VARIANT
+            else
+              echo FAILED > /tmp/bench-results/gradle/$BENCH_VARIANT
+            fi
+            cat /tmp/bench-results/gradle/$BENCH_VARIANT
       - persist_to_workspace:
+          when: always
           root: /tmp
           paths:
             - bench-results
 
-  compare-report:
+  benchmark-report:
     docker:
       - image: cimg/base:current
     steps:
       - attach_workspace:
           at: /tmp
       - run:
-          name: Cold vs. warm delta
+          name: Timing + cache-hit report
           command: |
-            cold=$(cat /tmp/bench-results/cold-ms)
-            warm=$(cat /tmp/bench-results/warm-ms)
-            delta=$((cold - warm))
-            pct=$(awk -v c="$cold" -v w="$warm" 'BEGIN { printf "%.1f", (1 - w/c) * 100 }')
-            echo "Cold:  ${cold} ms"
-            echo "Warm:  ${warm} ms"
-            echo "Delta: ${delta} ms (${pct}% faster warm)"
+            echo "=== Build time ==="
+            printf "%-15s %10s\n" "Variant" "Time (ms)"
+            printf "%-15s %10s\n" "---------------" "----------"
+            for variant in no-cache cache-server circleci-cache; do
+              f="/tmp/bench-results/gradle/$variant"
+              if [ -f "$f" ]; then
+                printf "%-15s %10s\n" "$variant" "$(cat "$f")"
+              else
+                printf "%-15s %10s\n" "$variant" "(missing)"
+              fi
+            done
+            echo
+            echo "=== Task outcomes (FROM-CACHE / UP-TO-DATE / NO-SOURCE / Executed / Total) ==="
+            for variant in no-cache cache-server circleci-cache; do
+              f="/tmp/bench-results/gradle-cache-summary/$variant"
+              if [ -f "$f" ]; then
+                echo "$variant: $(cat "$f")"
+              else
+                echo "$variant: (missing)"
+              fi
+            done
 
 workflows:
   cache-comparison:
     jobs:
-      - cold-build
-      - warm-build:
+      - seed-gradle
+      - benchmark-gradle:
+          name: "Gradle - No caching"
+          use_cache_subcommand: false
+          use_circleci_cache: false
           requires:
-            - cold-build
-      - compare-report:
+            - seed-gradle
+      - benchmark-gradle:
+          name: "Gradle - Cache server"
+          use_cache_subcommand: true
+          use_circleci_cache: false
           requires:
-            - warm-build
+            - seed-gradle
+      - benchmark-gradle:
+          name: "Gradle - CircleCI cache"
+          use_cache_subcommand: false
+          use_circleci_cache: true
+          requires:
+            - seed-gradle
+      - benchmark-report:
+          requires:
+            - "Gradle - No caching"
+            - "Gradle - Cache server"
+            - "Gradle - CircleCI cache"
