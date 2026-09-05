@@ -133,20 +133,11 @@ commands:
           destination: gradle-logs/<< parameters.variant >>.log
 
 jobs:
-  # Populates BOTH cache backends, via two separate builds:
-  #
-  # 1. with_tool_cache seeds whatever backing store the cache-server
-  #    mechanism uses (confirmed from an earlier run's log to be a local
-  #    HTTP proxy, not the on-disk ~/.gradle/caches/build-cache-1 dir).
-  # 2. A second, plain build with Gradle's *local* disk cache explicitly
-  #    enabled populates build-cache-1 for real, so that save_cache below
-  #    is actually snapshotting real task-output cache entries — not just
-  #    the downloaded-dependency cache under modules-2. Without this
-  #    second pass, the circleci-cache variant's restore_cache pulls a
-  #    ~/.gradle/caches that never had build-cache-1 entries in it, so it
-  #    can only ever save dependency-download time, not task-execution
-  #    time — a different (and smaller) effect than cache-server measures.
-  seed-gradle:
+  # Seeds the cache-server backing store only, on its own fresh machine.
+  # No local disk-cache pass here — that's a different job now, so
+  # buildSrc never has stale state from an earlier pass on this machine
+  # to worry about.
+  seed-gradle-cache-server:
     executor: gradle-machine
     steps:
       - checkout
@@ -159,8 +150,25 @@ jobs:
                 command: |
                   ./gradlew --no-daemon --build-cache --console=plain --info clean build \
                     2>&1 | tee /tmp/gradle-build-seed.log
+
+  # Populates BOTH cache backends' non-remote needs in one job: the whole
+  # ~/.gradle/caches tree (modules-2 dependencies AND build-cache-1 task
+  # outputs) plus the wrapper. Dependency warmth is a shared, mechanism-
+  # agnostic baseline — confirmed from configure/cmd.go that
+  # with_tool_cache's gradle case only ever writes a buildCache.remote
+  # init script, no dependency-resolution config at all — so giving
+  # cache-server the same warm deps this job produces for circleci-cache
+  # isn't borrowing credit across mechanisms, it's just not re-testing a
+  # problem neither one is responsible for solving. cache-server strips
+  # build-cache-1 back out after restoring (see its branch below) so its
+  # own task-output hits are still only ever coming from the remote store.
+  seed-gradle-circleci-cache:
+    executor: gradle-machine
+    steps:
+      - checkout
+      - install-jdk-17
       - run:
-          name: Seed build (local disk build cache, for circleci-cache)
+          name: Seed build (local disk build cache)
           command: |
             mkdir -p ~/.gradle/init.d
             cat > ~/.gradle/init.d/circleci.gradle.kts \<<'INNEREOF'
@@ -340,25 +348,36 @@ jobs:
 workflows:
   cache-comparison:
     jobs:
-      - seed-gradle
+      - seed-gradle-cache-server
+      - seed-gradle-circleci-cache
       - benchmark-gradle:
           name: "Gradle - No caching"
           use_cache_subcommand: false
           use_circleci_cache: false
           requires:
-            - seed-gradle
+            # No-cache doesn't consume either seed's cache, but keeping it
+            # ordered after both means all three benchmark jobs run under
+            # comparable machine/network conditions rather than one racing
+            # ahead while the seeds are still warming up shared resources.
+            - seed-gradle-cache-server
+            - seed-gradle-circleci-cache
       - benchmark-gradle:
           name: "Gradle - Cache server"
           use_cache_subcommand: true
           use_circleci_cache: false
           requires:
-            - seed-gradle
+            # Needs seed-gradle-cache-server for the remote backing store,
+            # AND seed-gradle-circleci-cache for the restore_cache further
+            # down in its steps (warm modules-2 dependencies only — see
+            # the comment there).
+            - seed-gradle-cache-server
+            - seed-gradle-circleci-cache
       - benchmark-gradle:
           name: "Gradle - CircleCI cache"
           use_cache_subcommand: false
           use_circleci_cache: true
           requires:
-            - seed-gradle
+            - seed-gradle-circleci-cache
       - benchmark-report:
           requires:
             - "Gradle - No caching"
